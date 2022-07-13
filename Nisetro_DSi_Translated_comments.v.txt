@@ -1,0 +1,547 @@
+//`define DEBUG	//Comment out when debugging
+
+module nisetroi(FX2_SLOE, FX2_SLRD, FX2_SLWR, FX2_FD, FX2_FIFOADR, FX2_PKTEND,
+		FX2_FLAGA, FX2_FLAGB, FX2_FLAGC, FX2_IFCLK,
+
+		MODE, ADDR, RESET, DIR,
+		CLK,Vsync, Hsync, LCDR1, LCDG1, LCDB1, LCDR2, LCDG2, LCDB2,   // LCD data
+		SND_MCLK, SND_WS, SND_SDO, SOUT,                              // Audio data
+		);
+
+//FX2 signal definition
+output FX2_SLOE;
+output FX2_SLRD;
+output FX2_SLWR;
+inout  [7:0] FX2_FD;
+output [1:0] FX2_FIFOADR;
+output FX2_PKTEND;
+input  FX2_FLAGA;
+input  FX2_FLAGB;
+input  FX2_FLAGC;
+input  FX2_IFCLK;
+
+`define	MODE_START	0	//Sampling status
+`define	MODE_REGR	1	//Read register
+`define	MODE_REGW	2	//Write register
+`define MODE_IDLE	3	//Stopped state
+
+`define DIR_FX2PC 0
+`define DIR_PC2FX 1
+input   DIR;
+
+input  [1:0] MODE;		//Mode setting signal
+input  [2:0] ADDR;		//Register selection signal
+input  RESET;			//Reset signal
+
+input  CLK;				//dot clock
+input  [5:0] LCDR1;		//
+input  [5:0] LCDG1;		//
+input  [5:0] LCDB1;		//
+input  [5:0] LCDR2;		//
+input  [5:0] LCDG2;		//
+input  [5:0] LCDB2;		//
+input  Vsync, Hsync;
+
+input  SND_MCLK;
+input  SND_WS;
+input  SND_SDO;
+output SOUT;
+
+wire  [7:0] reg_data;		//Register read signal
+reg   [23:0] all_cnt;		//Sampling counter
+reg         screen;
+reg         scboth;
+reg   [1:0] f_skip;
+reg         flip;
+
+//Register write processing
+always @(posedge FX2_IFCLK)
+begin
+	if((MODE == `MODE_REGW)&&(ADDR == 0)) begin
+		screen   <= FX2_FD[2];
+		scboth   <= FX2_FD[3];
+		f_skip   <= FX2_FD[1:0];
+	end
+end
+
+//Register read processing
+assign reg_data = ((ADDR == 0)&&(DIR == `DIR_FX2PC)) ? all_cnt[7:0] :
+                  ((ADDR == 1)&&(DIR == `DIR_FX2PC)) ? all_cnt[15:8] :
+                  ((ADDR == 2)&&(DIR == `DIR_FX2PC)) ? all_cnt[23:16] :
+                  ((ADDR == 3)&&(DIR == `DIR_FX2PC)) ? 0 :
+                  ((ADDR == 4)&&(DIR == `DIR_FX2PC)) ? 0 :
+                  ((ADDR == 5)&&(DIR == `DIR_FX2PC)) ? 0 :
+                  ((ADDR == 6)&&(DIR == `DIR_FX2PC)) ? 0 :
+                  ((ADDR == 7)&&(DIR == `DIR_FX2PC)) ? 0 :
+                                                       0;
+
+reg  [7:0] byte_data;
+
+// To convert data between sampling clock and FX2 clock (48MHz)
+// Use 14 sets of buffers
+reg  [5:0] datR [0:13], datG [0:13], datB [0:13];
+reg  [1:0] sync [0:13];
+
+wire lVsync;
+reg  dVsync;
+reg  [3:0] sw1;		//Buffer selector switch
+reg  [8:0] Pcnt;
+reg  [4:0] Dcnt;
+reg  [7:0] Lcnt;
+reg  [1:0] Fcnt;
+reg  Initskip;
+reg  Hactive, Vactive, Factive;
+wire Active;
+reg  Vflag;
+wire DCLK;
+reg	 [3:0] CLKDELAY;
+reg	 [3:0] VSYNCDELAY;
+wire [3:0] sw1_0;
+wire [3:0] sw1_1;
+
+
+// Vsync is too long, so cut it short
+assign lVsync = (~Vsync) & (~VSYNCDELAY[3]);
+always @( posedge DCLK ) begin
+	VSYNCDELAY <= VSYNCDELAY << 1;
+	VSYNCDELAY[0] <= Hactive;
+end
+
+// Double the CLK frequency using 48MHz FX2_IFCLK.
+assign DCLK = CLK ^ CLKDELAY[3];
+always @( posedge FX2_IFCLK ) begin
+	CLKDELAY <= CLKDELAY << 1;
+	CLKDELAY[0] <= CLK;
+end
+
+// Do not output data until the first Vsync comes
+always @( posedge lVsync or posedge RESET) begin
+	if( RESET == 1 ) begin
+		Initskip <= 0;
+	end else begin
+		Initskip <= 1;
+	end
+end
+
+// Only data of 27 to 283 dots is valid in one line (300 dots)
+always @( posedge DCLK or posedge Hsync ) begin
+
+	if( Hsync == 1 ) begin
+		Pcnt <= 0;
+		Hactive <= 0;
+	end else begin
+		if( Initskip == 1) begin
+			Pcnt <= Pcnt + 1'b1;
+		end
+		if( Pcnt == 27 ) begin
+			Hactive <= 1;
+		end else begin
+			if( Pcnt == 283 ) begin
+				Hactive <= 0;
+			end
+		end
+	end
+
+end
+
+// Invalid after 192 lines in 1 frame
+always @( posedge Hsync or posedge lVsync) begin
+	if( lVsync == 1 ) begin
+		Lcnt <= 0;
+		Vactive <= 1;
+	end else begin
+		Lcnt <= Lcnt + 1'b1;
+		if( Lcnt == 0 ) begin
+			Vactive <= 1;
+		end else begin
+			if( Lcnt == 191 ) begin
+				Vactive <= 0;
+			end
+		end
+	end
+end
+
+// Frame count and frame skip processing
+always @( posedge lVsync or posedge RESET ) begin
+	if( RESET == 1 ) begin	//RESET
+		all_cnt <= 0;
+		Factive <= 0;
+	end else begin
+		flip <= 1;
+		all_cnt <= all_cnt + 1;	//
+
+		if( Fcnt == 0 ) begin
+			Factive <= 1;
+		end else begin
+			Factive <= 0;
+		end
+
+		if( Fcnt == f_skip ) begin
+			Fcnt <= 0;
+		end else begin
+			Fcnt <= Fcnt + 1;		
+		end
+	end
+end
+
+assign Active = Hactive & Vactive & Factive & Initskip;
+
+assign sw1_0 = { sw1[3:1], 1'b0 };
+assign sw1_1 = { sw1[3:1], 1'b1 };
+
+always @( posedge DCLK or posedge RESET) begin
+	if( RESET == 1 ) begin
+		sw1 <= 0;
+	end else begin
+		if(DIR == `DIR_FX2PC) begin
+			if( ( MODE == `MODE_START ) && Active ) begin
+				if ( scboth == 0 ) begin
+					if ( screen == 0 ) begin
+						begin				// store in buffer
+							datR[sw1] <= LCDR2;
+							datG[sw1] <= LCDG2;
+							datB[sw1] <= LCDB2;
+							sync[sw1][1] <= lVsync;
+							sync[sw1][0] <= 0;
+						end
+
+						if(sw1 ==  4'b1101)
+							sw1 <= 0;
+						else
+							sw1 <= sw1 + 1;				// Buffer switch switching
+					end else begin
+						begin				// store in buffer
+							datR[sw1] <= LCDR1;
+							datG[sw1] <= LCDG1;
+							datB[sw1] <= LCDB1;
+							sync[sw1][1] <= lVsync;
+							sync[sw1][0] <= 1;
+						end
+
+						if(sw1 ==  4'b1101)
+							sw1 <= 0;
+						else
+							sw1 <= sw1 + 1;				// Buffer switch switching
+					end
+				end else begin
+					begin				// store in buffer
+						datR[sw1_0] <= LCDR2;
+						datG[sw1_0] <= LCDG2;
+						datB[sw1_0] <= LCDB2;
+						sync[sw1_0][1] <= lVsync;
+						sync[sw1_0][0] <= 0;
+
+						datR[sw1_1] <= LCDR1;
+						datG[sw1_1] <= LCDG1;
+						datB[sw1_1] <= LCDB1;
+						sync[sw1_1][1] <= lVsync;
+						sync[sw1_1][0] <= 1;
+					end
+
+					begin
+						if(sw1 >=  4'b1100)
+							sw1 <= 0;
+						else
+							sw1 <= sw1 + 2;				// Buffer switch switching
+					end
+				end
+			end
+		end
+	end
+end
+
+reg slwr;
+
+reg [1:0] tcnt;			// Counter for USB transfer 1 byte at a time
+reg [3:0] tsw;			// Buffer switch for USB transfer
+reg [3:0] _sw;			// Sample buffer switch (SW) synchronized with the FX2 clock
+reg [7:0] fifo_data;	// Data to be transferred via USB
+
+// FX2 main processing
+always@ (posedge FX2_IFCLK or posedge RESET) begin
+	if(RESET == 1) begin	// Initialization with RESET signal
+		tsw <= 0;
+		tcnt <= 0;
+		_sw <= 0;
+	end else begin
+		if( FX2_FLAGB == 1 ) begin
+			_sw <= sw1;	// Synchronize sw updated by the sampling clock with the FX2 clock
+			if(tsw != _sw) begin	// Is the sample data ready?
+				slwr <= 0;	// Enable FX2 write signal
+				fifo_data <= data_sel(tcnt, datR[tsw], datG[tsw], datB[tsw], sync[tsw]);
+												 	// Set the data to be transferred
+				tcnt <= tcnt + 1;
+				if(tcnt == 2) begin
+					tcnt <= 0;
+					if(tsw == 4'b1101)
+						tsw <= 0;
+					else
+						tsw <= tsw + 1;				// Update transfer buffer switch
+				end
+			end
+			else begin
+				slwr <= 1;	// Disable FX2 write signal
+			end
+		end else begin
+			slwr <= 1;	// Disable FX2 write signal
+		end
+//		if ( Active == 0 ) begin
+//			FX2_PKTEND <= 1;
+//		end else begin
+//			FX2_PKTEND <= 0;
+//		end
+	end
+end
+
+
+// Select the data (1 byte) to be transferred by FX2 from the buffer
+function [7:0] data_sel;
+	input [1:0] tcnt;
+	input [5:0] datR, datG, datB;
+	input [1:0] sync;
+
+	data_sel[7:6] = sync;
+	
+	case(tcnt)
+		0: data_sel[5:0] = datR;
+		1: data_sel[5:0] = datG;
+		2: data_sel[5:0] = datB;
+		3: data_sel[5:0] = 0;
+	endcase
+endfunction
+
+assign FX2_SLOE = ((DIR == `DIR_PC2FX)&&(MODE == `MODE_START)) ? 0 : 1;
+assign FX2_FIFOADR = (DIR == `DIR_FX2PC) ? 2 : 0;
+assign FX2_PKTEND = 1;
+//assign FX2_SLRD = slrd;
+assign FX2_SLWR = slwr;
+// FX2 fifo bus is switched appropriately with MODE signal
+assign FX2_FD = ((MODE == `MODE_REGW) || ((DIR == `DIR_PC2FX)&&(MODE == `MODE_START))) ? 8'bzzzzzzzz :
+				(MODE == `MODE_REGR) ? reg_data    : fifo_data;
+
+// I2S-> S / PDIF conversion 32kHz only
+
+reg  [7:0] MCLKCNT;
+reg  [1:0] WSCHGCK;
+reg  [15:0] SNDBUF [0:1];
+wire       MCNTRST;
+wire [3:0] MCNT_SDO;
+wire       MCLK_SDO;
+wire       MCLK128;
+reg        SPDIF;
+wire [5:0] MCNT_SPDIF;
+reg  [7:0] FRMCNT;
+reg        Channel;
+reg        Parity;
+wire       WS,nWS;
+
+assign MCNTRST = WSCHGCK[0] ^ WSCHGCK[1];    // Subframe counter reset signal
+assign MCNT_SDO = MCLKCNT[6:3];
+//assign MCNT64  = MCLKCNT[6:1];
+assign MCLK128  = MCLKCNT[0];
+assign MCLK_SDO = MCLKCNT[2];
+assign MCNT_SPDIF = MCLKCNT[6:1];
+assign SOUT    = SPDIF;
+assign WS      = WSCHGCK[0];
+assign nWS     = ~WSCHGCK[0];
+
+// Word clock
+always@ (posedge SND_MCLK )begin
+	WSCHGCK <= WSCHGCK << 1;
+	WSCHGCK[0] <= SND_WS;
+end
+
+always@ (negedge SND_MCLK or posedge MCNTRST )begin
+	if ( MCNTRST == 1 )
+		MCLKCNT <= 0;
+	else
+		MCLKCNT <= MCLKCNT + 1;
+end
+
+// Frame count counter
+always@ ( posedge WS )begin
+	if ( FRMCNT == 191 )
+			FRMCNT <= 0;	
+		else
+			FRMCNT <= FRMCNT + 1;
+
+// Create Channel bit
+	case( FRMCNT )
+		2,24,25,33:	Channel <= 1;
+		default:	Channel <= 0;
+	endcase
+end
+
+always@ (posedge MCLK_SDO ) begin
+//	case( MCNT_SDO )
+//		4'b0000:	SNDBUF[nWS][0] <= SND_SDO;
+//		4'b0001:	SNDBUF[WS][15] <= SND_SDO;
+//		4'b0010:	SNDBUF[WS][14] <= SND_SDO;
+//		4'b0011:	SNDBUF[WS][13] <= SND_SDO;
+//		4'b0100:	SNDBUF[WS][12] <= SND_SDO;
+//		4'b0101:	SNDBUF[WS][11] <= SND_SDO;
+//		4'b0110:	SNDBUF[WS][10] <= SND_SDO;
+//		4'b0111:	SNDBUF[WS][9] <= SND_SDO;
+//		4'b1000:	SNDBUF[WS][8] <= SND_SDO;
+//		4'b1001:	SNDBUF[WS][7] <= SND_SDO;
+//		4'b1010:	SNDBUF[WS][6] <= SND_SDO;
+//		4'b1011:	SNDBUF[WS][5] <= SND_SDO;
+//		4'b1100:	SNDBUF[WS][4] <= SND_SDO;
+//		4'b1101:	SNDBUF[WS][3] <= SND_SDO;
+//		4'b1110:	SNDBUF[WS][2] <= SND_SDO;
+//		4'b1111:	SNDBUF[WS][1] <= SND_SDO;
+//	endcase
+  if( MCNT_SDO == 4'b0000 ) begin
+    SNDBUF[nWS][0] <= SND_SDO;
+  end else begin
+	SNDBUF[WS] <= SNDBUF[WS] << 1;
+	SNDBUF[WS][1] <= SND_SDO;
+  end
+end
+
+// S / PDIF data creation
+always@ (posedge MCLK128 )begin
+	if( MCNT_SPDIF <= 7 ) begin               // Create Sync
+		if( nWS == 0 ) begin
+			if( FRMCNT == 0 ) begin
+				case( MCNT_SPDIF )            // ‚a ‚P‚P‚P‚O‚P‚O‚O‚O
+					0:	SPDIF <= ~SPDIF;
+					1:	SPDIF <= SPDIF;
+					2:	SPDIF <= SPDIF;
+					3:	SPDIF <= ~SPDIF;
+					4:	SPDIF <= ~SPDIF;
+					5:	SPDIF <= ~SPDIF;
+					6:	SPDIF <= SPDIF;
+					7:	SPDIF <= SPDIF;
+				endcase
+			end else begin
+				case( MCNT_SPDIF )            // ‚l ‚P‚P‚P‚O‚O‚O‚P‚O
+					0:	SPDIF <= ~SPDIF;
+					1:	SPDIF <= SPDIF;
+					2:	SPDIF <= SPDIF;
+					3:	SPDIF <= ~SPDIF;
+					4:	SPDIF <= SPDIF;
+					5:	SPDIF <= SPDIF;
+					6:	SPDIF <= ~SPDIF;
+					7:	SPDIF <= ~SPDIF;
+				endcase
+			end
+		end else begin
+			case( MCNT_SPDIF )            // ‚v ‚P‚P‚P‚O‚O‚P‚O‚O
+				0:	SPDIF <= ~SPDIF;
+				1:	SPDIF <= SPDIF;
+				2:	SPDIF <= SPDIF;
+				3:	SPDIF <= ~SPDIF;
+				4:	SPDIF <= SPDIF;
+				5:	SPDIF <= ~SPDIF;
+				6:	SPDIF <= ~SPDIF;
+				7:	SPDIF <= SPDIF;
+			endcase
+		end
+	end else begin                             // Create data part
+		if ( MCNT_SPDIF[0] == 0 ) begin
+			SPDIF <= ~SPDIF;
+		end else begin
+			case( MCNT_SPDIF )
+//				6'b001001:	SPDIF <= SPDIF ^ 0;
+//				6'b001011:	SPDIF <= SPDIF ^ 0;
+//				6'b001101:	SPDIF <= SPDIF ^ 0;
+//				6'b001111:	SPDIF <= SPDIF ^ 0;
+//				6'b010001:	SPDIF <= SPDIF ^ 0;
+//				6'b010011:	SPDIF <= SPDIF ^ 0;
+//				6'b010101:	SPDIF <= SPDIF ^ 0;
+//				6'b010111:	SPDIF <= SPDIF ^ 0;
+				6'b011001:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][0];
+						Parity <= SNDBUF[nWS][0];
+					end
+				6'b011011:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][1];
+						Parity <= Parity + SNDBUF[nWS][1];
+					end
+				6'b011101:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][2];
+						Parity <= Parity + SNDBUF[nWS][2];
+					end
+				6'b011111:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][3];
+						Parity <= Parity + SNDBUF[nWS][3];
+					end
+				6'b100001:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][4];
+						Parity <= Parity + SNDBUF[nWS][4];
+					end
+				6'b100011:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][5];
+						Parity <= Parity + SNDBUF[nWS][5];
+					end
+				6'b100101:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][6];
+						Parity <= Parity + SNDBUF[nWS][6];
+					end
+				6'b100111:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][7];
+						Parity <= Parity + SNDBUF[nWS][7];
+					end
+				6'b101001:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][8];
+						Parity <= Parity + SNDBUF[nWS][8];
+					end
+				6'b101011:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][9];
+						Parity <= Parity + SNDBUF[nWS][9];
+					end
+				6'b101101:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][10];
+						Parity <= Parity + SNDBUF[nWS][10];
+					end
+				6'b101111:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][11];
+						Parity <= Parity + SNDBUF[nWS][11];
+					end
+				6'b110001:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][12];
+						Parity <= Parity + SNDBUF[nWS][12];
+					end
+				6'b110011:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][13];
+						Parity <= Parity + SNDBUF[nWS][13];
+					end
+				6'b110101:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][14];
+						Parity <= Parity + SNDBUF[nWS][14];
+					end
+				6'b110111:
+					begin
+						SPDIF <= SPDIF ^ SNDBUF[nWS][15];
+						Parity <= Parity + SNDBUF[nWS][15];
+					end
+//				6'b111001:	SPDIF <= SPDIF ^ 0;     	// V
+//				6'b111011:	SPDIF <= SPDIF ^ 0;     	// U
+				6'b111101:
+					begin
+						SPDIF <= SPDIF ^ Channel;	// C
+						Parity <= Parity + Channel;
+					end
+				6'b111111:	SPDIF <= SPDIF ^ Parity;	// P
+			endcase
+		end
+	end
+end
+
+endmodule
